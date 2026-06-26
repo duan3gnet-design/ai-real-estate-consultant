@@ -1,0 +1,42 @@
+{
+  "name": "ai-real-estate-consultant",
+  "version": "1.0.0",
+  "description": "AI Tư Vấn Bất Động Sản - Desktop App",
+  "main": "electron/main.js",
+  "scripts": {
+    "dev": "concurrently \"npm run dev:frontend\" \"npm run dev:electron\"",
+    "dev:frontend": "cd frontend && npm run dev",
+    "dev:electron": "wait-on http://localhost:5173 && electron .",
+    "build": "cd frontend && npm run build && electron-builder",
+    "start:backend": "cd backend && python main.py",
+    "install:all": "npm install && cd frontend && npm install"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0",
+    "electron": "^42.5.0",
+    "electron-builder": "^26.15.3",
+    "wait-on": "^8.0.1"
+  },
+  "build": {
+    "appId": "com.realestate.ai-consultant",
+    "productName": "AI Tư Vấn BĐS",
+    "directories": {
+      "output": "dist-electron"
+    },
+    "files": [
+      "electron/**/*",
+      "frontend/dist/**/*"
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "frontend/public/icon.ico"
+    },
+    "mac": {
+      "target": "dmg",
+      "icon": "frontend/public/icon.icns"
+    },
+    "linux": {
+      "target": "AppImage"
+    }
+  }
+}

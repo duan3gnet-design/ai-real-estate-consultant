@@ -1,0 +1,9 @@
+### Environment Variables ###
+.env
+
+.venv/
+.vscode/
+__pycache__/
+node_modules/
+
+python/data/
