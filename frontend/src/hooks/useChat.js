@@ -11,13 +11,12 @@ export function useChat(model) {
 
   const createSession = useCallback(() => {
     const id = Date.now().toString()
-    const session = {
+    setSessions(prev => [{
       id,
       title: 'Cuộc trò chuyện mới',
       messages: [],
       createdAt: new Date(),
-    }
-    setSessions(prev => [session, ...prev])
+    }, ...prev])
     setActiveSessionId(id)
     return id
   }, [])
@@ -28,88 +27,78 @@ export function useChat(model) {
     let sessionId = activeSessionId
     if (!sessionId) {
       sessionId = Date.now().toString()
-      const session = {
+      setSessions(prev => [{
         id: sessionId,
         title: content.slice(0, 40) + (content.length > 40 ? '...' : ''),
         messages: [],
         createdAt: new Date(),
-      }
-      setSessions(prev => [session, ...prev])
+      }, ...prev])
       setActiveSessionId(sessionId)
     }
 
     const userMsg = { role: 'user', content, id: Date.now() }
 
     setSessions(prev => prev.map(s =>
-      s.id === sessionId
-        ? {
-            ...s,
-            messages: [...s.messages, userMsg],
-            title: s.messages.length === 0 ? content.slice(0, 40) + (content.length > 40 ? '...' : '') : s.title,
-          }
-        : s
+      s.id === sessionId ? {
+        ...s,
+        messages: [...s.messages, userMsg],
+        title: s.messages.length === 0
+          ? content.slice(0, 40) + (content.length > 40 ? '...' : '')
+          : s.title,
+      } : s
     ))
 
     const assistantMsgId = Date.now() + 1
-    const assistantMsg = { role: 'assistant', content: '', id: assistantMsgId, streaming: true }
 
     setSessions(prev => prev.map(s =>
       s.id === sessionId
-        ? { ...s, messages: [...s.messages, assistantMsg] }
+        ? { ...s, messages: [...s.messages, { role: 'assistant', content: '', id: assistantMsgId, streaming: true }] }
         : s
     ))
 
     setIsStreaming(true)
 
     try {
-      const allMessages = [
-        ...(sessions.find(s => s.id === sessionId)?.messages ?? []),
-        userMsg,
-      ].map(({ role, content }) => ({ role, content }))
+      const historyMessages = sessions.find(s => s.id === sessionId)?.messages ?? []
+      const allMessages = [...historyMessages, userMsg].map(({ role, content }) => ({ role, content }))
 
-      await streamChat(
-        allMessages,
-        model,
+      await streamChat(allMessages, model,
+        // onChunk
         (chunk) => {
           setSessions(prev => prev.map(s =>
-            s.id === sessionId
-              ? {
-                  ...s,
-                  messages: s.messages.map(m =>
-                    m.id === assistantMsgId
-                      ? { ...m, content: m.content + chunk }
-                      : m
-                  ),
-                }
-              : s
+            s.id === sessionId ? {
+              ...s,
+              messages: s.messages.map(m =>
+                m.id === assistantMsgId ? { ...m, content: m.content + chunk } : m
+              ),
+            } : s
           ))
         },
+        // onDone
         () => {
           setSessions(prev => prev.map(s =>
-            s.id === sessionId
-              ? {
-                  ...s,
-                  messages: s.messages.map(m =>
-                    m.id === assistantMsgId ? { ...m, streaming: false } : m
-                  ),
-                }
-              : s
+            s.id === sessionId ? {
+              ...s,
+              messages: s.messages.map(m =>
+                m.id === assistantMsgId ? { ...m, streaming: false } : m
+              ),
+            } : s
           ))
           setIsStreaming(false)
-        }
+        },
+        // options — bật consultation RAG
+        { useConsultations: true },
       )
     } catch (err) {
       setSessions(prev => prev.map(s =>
-        s.id === sessionId
-          ? {
-              ...s,
-              messages: s.messages.map(m =>
-                m.id === assistantMsgId
-                  ? { ...m, content: `❌ Lỗi: ${err.message}`, streaming: false }
-                  : m
-              ),
-            }
-          : s
+        s.id === sessionId ? {
+          ...s,
+          messages: s.messages.map(m =>
+            m.id === assistantMsgId
+              ? { ...m, content: `❌ Lỗi: ${err.message}`, streaming: false }
+              : m
+          ),
+        } : s
       ))
       setIsStreaming(false)
     }
@@ -117,20 +106,11 @@ export function useChat(model) {
 
   const deleteSession = useCallback((id) => {
     setSessions(prev => prev.filter(s => s.id !== id))
-    if (activeSessionId === id) {
-      setActiveSessionId(null)
-    }
+    if (activeSessionId === id) setActiveSessionId(null)
   }, [activeSessionId])
 
   return {
-    sessions,
-    activeSession,
-    activeSessionId,
-    messages,
-    isStreaming,
-    createSession,
-    sendMessage,
-    deleteSession,
-    setActiveSessionId,
+    sessions, activeSession, activeSessionId, messages, isStreaming,
+    createSession, sendMessage, deleteSession, setActiveSessionId,
   }
 }

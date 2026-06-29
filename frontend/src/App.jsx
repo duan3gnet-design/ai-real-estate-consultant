@@ -1,16 +1,18 @@
 import { useState } from 'react'
-import { MessageSquare, Building2 } from 'lucide-react'
+import { MessageSquare, Building2, ClipboardList } from 'lucide-react'
 import TitleBar from './components/TitleBar'
 import Sidebar from './components/Sidebar'
 import MessageList from './components/MessageList'
 import ChatInput from './components/ChatInput'
 import PropertyManager from './components/PropertyManager'
+import ConsultationManager from './components/ConsultationManager'
 import { useChat } from './hooks/useChat'
 import { useScrollToBottom, useBackendStatus } from './hooks/useUtils'
 
 const TABS = [
-  { id: 'chat',       label: 'Tư vấn AI',   icon: MessageSquare },
-  { id: 'portfolio',  label: 'Danh mục BĐS', icon: Building2 },
+  { id: 'chat',          label: 'Tư vấn AI',      icon: MessageSquare },
+  { id: 'portfolio',     label: 'Danh mục BĐS',   icon: Building2 },
+  { id: 'consultations', label: 'Lịch sử Tư vấn', icon: ClipboardList },
 ]
 
 export default function App() {
@@ -27,16 +29,15 @@ export default function App() {
 
   const statusLabel = {
     checking: 'Đang kết nối...',
-    online: 'Backend đang chạy',
+    online: 'Backend sẵn sàng',
     error: 'Không kết nối được backend',
   }[backendStatus]
 
   return (
     <div className="app">
       <TitleBar />
-
       <div className="main-layout">
-        {/* Sidebar — chỉ hiện khi tab chat */}
+        {/* Sidebar — chỉ hiện ở tab chat */}
         {activeTab === 'chat' && (
           <Sidebar
             sessions={sessions}
@@ -49,9 +50,8 @@ export default function App() {
           />
         )}
 
-        {/* Main content */}
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-          {/* Tab navigation */}
+          {/* Tab bar */}
           <div className="app-tabs">
             {TABS.map(({ id, label, icon: Icon }) => (
               <button
@@ -65,7 +65,7 @@ export default function App() {
             ))}
           </div>
 
-          {/* Chat view */}
+          {/* Chat */}
           {activeTab === 'chat' && (
             <div className="chat-area">
               <MessageList
@@ -79,7 +79,7 @@ export default function App() {
                 <span>{statusLabel}</span>
                 {backendStatus === 'online' && (
                   <span style={{ color: 'var(--slate-500)', marginLeft: 8 }}>
-                    · Hybrid Search (Vector + FTS) đang hoạt động
+                    · RAG Hybrid Search (BĐS + Lịch sử tư vấn)
                   </span>
                 )}
               </div>
@@ -90,10 +90,17 @@ export default function App() {
             </div>
           )}
 
-          {/* Portfolio view */}
+          {/* BĐS Manager */}
           {activeTab === 'portfolio' && (
             <div style={{ flex: 1, overflow: 'hidden' }}>
               <PropertyManager />
+            </div>
+          )}
+
+          {/* Consultation Manager */}
+          {activeTab === 'consultations' && (
+            <div style={{ flex: 1, overflow: 'hidden' }}>
+              <ConsultationManager />
             </div>
           )}
         </div>
