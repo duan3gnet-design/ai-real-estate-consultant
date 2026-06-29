@@ -168,7 +168,7 @@ def save_transcript_chunks(session_id: int, chunks: list[dict]) -> int:
                     c.get("content", ""),
                     c.get("start_time"),
                     c.get("end_time"),
-                    json.dumps(c.get("topics", []), ensure_ascii=False) if isinstance(c.get("topics"), list) else c.get("topics", ""),
+                    json.dumps(c.get("topics", []), ensure_ascii=False) if isinstance(c.get("topics"), list) else c.get("topics"),
                     c.get("sentiment"),
                 ),
             )
