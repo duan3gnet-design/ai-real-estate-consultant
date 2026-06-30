@@ -214,7 +214,7 @@ TRANSCRIPT:
                 raw = raw[4:]
         result = json.loads(raw)
 
-        # Lưu điểm và feedback vào DB
+        # Lưu điểm và feedback vào ES
         update_session(req.session_id, {
             "diem_chat_luong": result.get("diem_tong"),
             "ai_feedback": json.dumps(result, ensure_ascii=False),
@@ -251,12 +251,16 @@ async def import_json_file(file: UploadFile = File(...)):
 
 @router.post("/reindex")
 async def reindex():
-    """Re-index toàn bộ sessions + chunks vào vector store."""
+    """Re-index toàn bộ sessions + chunks vào Elasticsearch (rebuild embeddings)."""
+    from app.es_client import get_es, IDX_SESSIONS, IDX_CHUNKS
     from app.services.consultation_search import index_sessions_batch, index_chunks_batch
-    conn = __import__("app.database", fromlist=["get_connection"]).get_connection()
-    sessions = [dict(r) for r in conn.execute("SELECT * FROM consultation_sessions").fetchall()]
-    chunks = [dict(r) for r in conn.execute("SELECT * FROM transcript_chunks").fetchall()]
-    conn.close()
+
+    es = get_es()
+    sessions_resp = es.search(index=IDX_SESSIONS, query={"match_all": {}}, size=10000)
+    chunks_resp = es.search(index=IDX_CHUNKS, query={"match_all": {}}, size=10000)
+    sessions = [hit["_source"] for hit in sessions_resp["hits"]["hits"]]
+    chunks = [hit["_source"] for hit in chunks_resp["hits"]["hits"]]
+
     index_sessions_batch(sessions)
     index_chunks_batch(chunks)
     return {"sessions": len(sessions), "chunks": len(chunks)}
@@ -271,7 +275,6 @@ def _parse_raw_transcript(text: str) -> list[dict]:
     - [KH]: nội dung
     - Tư vấn viên: nội dung
     - Khách hàng: nội dung
-    - HH:MM:SS nội dung
     """
     import re
     chunks = []
@@ -297,7 +300,6 @@ def _parse_raw_transcript(text: str) -> list[dict]:
         if not line:
             continue
 
-        # Pattern: [SPEAKER]: content hoặc SPEAKER: content
         m = re.match(r"^\[?([^\]:\n]{1,30})\]?\s*:\s*(.+)$", line, re.IGNORECASE)
         if m:
             flush()
@@ -308,12 +310,10 @@ def _parse_raw_transcript(text: str) -> list[dict]:
             if content:
                 current_lines.append(content)
         else:
-            # Tiếp tục dòng trước
             current_lines.append(line)
 
     flush()
 
-    # Nếu không parse được → chunk theo đoạn văn
     if not chunks:
         paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
         for i, p in enumerate(paragraphs):

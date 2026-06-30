@@ -1,62 +1,18 @@
 """
-Hybrid Search Service
-=====================
-Kết hợp 2 phương pháp:
-1. Vector Search  – ChromaDB + sentence-transformers (tìm ngữ nghĩa)
-2. Full-text + Filter – SQLite FTS5 + structured filters (tìm chính xác)
+Hybrid Search Service — Elasticsearch
+=======================================
+Kết hợp:
+1. Vector Search  – ES kNN trên field `embedding` (dense_vector)
+2. Full-text + Filter – ES multi_match + bool filter trên text fields
 
-Kết quả được merge theo thuật toán Reciprocal Rank Fusion (RRF),
-trả về top-K BĐS phù hợp nhất để inject vào prompt AI.
+Merge bằng Reciprocal Rank Fusion (RRF) thủ công (tương thích mọi version ES).
 """
-
-import re
-import sqlite3
-import threading
 from typing import Optional
-from pathlib import Path
 
-from app.database import get_connection, DB_PATH
+from app.es_client import get_es, IDX_PROPERTIES
+from app.embedding import embed_text, embed_texts
 
-# ChromaDB + embeddings (lazy import để không chặn startup)
-_chroma_client = None
-_chroma_collection = None
-_embed_model = None
-_chroma_lock = threading.Lock()
-
-CHROMA_DIR = DB_PATH.parent / "chroma"
-EMBED_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"  # hỗ trợ tiếng Việt, nhẹ ~120MB
-
-
-def _get_chroma():
-    """Lazy-load ChromaDB và embedding model (lần đầu mất ~5-10s)."""
-    global _chroma_client, _chroma_collection, _embed_model
-    with _chroma_lock:
-        if _chroma_collection is not None:
-            return _chroma_collection, _embed_model
-
-        try:
-            import chromadb
-            from chromadb.config import Settings
-            from sentence_transformers import SentenceTransformer
-
-            print("[VectorSearch] Loading embedding model...")
-            _embed_model = SentenceTransformer(EMBED_MODEL_NAME)
-
-            CHROMA_DIR.mkdir(parents=True, exist_ok=True)
-            _chroma_client = chromadb.PersistentClient(
-                path=str(CHROMA_DIR),
-                settings=Settings(anonymized_telemetry=False),
-            )
-            _chroma_collection = _chroma_client.get_or_create_collection(
-                name="properties",
-                metadata={"hnsw:space": "cosine"},
-            )
-            print(f"[VectorSearch] Ready. Collection size: {_chroma_collection.count()}")
-            return _chroma_collection, _embed_model
-
-        except ImportError as e:
-            print(f"[VectorSearch] DISABLED – missing package: {e}")
-            return None, None
+_TEXT_FIELDS = ["ten^3", "dia_chi^2", "phuong_xa", "quan_huyen^2", "tinh_thanh^2", "loai", "tien_ich", "mo_ta", "quy_hoach"]
 
 
 def _row_to_text(row: dict) -> str:
@@ -86,188 +42,157 @@ def _row_to_text(row: dict) -> str:
         parts.append(row["tien_ich"])
     if row.get("mo_ta"):
         parts.append(row["mo_ta"][:300])
-    return " | ".join(p for p in parts if p.strip())
+    return " | ".join(p for p in parts if p and p.strip())
 
 
 def index_property(prop_id: int, row: dict):
-    """Thêm/cập nhật 1 BĐS vào vector store."""
-    col, model = _get_chroma()
-    if col is None:
-        return
+    """Thêm/cập nhật 1 BĐS vào Elasticsearch (kèm embedding)."""
+    es = get_es()
     text = _row_to_text(row)
-    embedding = model.encode(text).tolist()
-    col.upsert(
-        ids=[str(prop_id)],
-        embeddings=[embedding],
-        documents=[text],
-        metadatas=[{"id": prop_id}],
-    )
+    doc = {k: v for k, v in row.items() if v is not None}
+    doc["embedding"] = embed_text(text)
+    es.index(index=IDX_PROPERTIES, id=str(prop_id), document=doc)
 
 
 def index_properties_batch(rows: list[dict], batch_size: int = 500):
-    """Bulk index nhiều BĐS (dùng khi import)."""
-    col, model = _get_chroma()
-    if col is None:
-        return
+    """Bulk index nhiều BĐS bằng ES bulk API."""
+    from elasticsearch.helpers import bulk
+    es = get_es()
+
     for i in range(0, len(rows), batch_size):
         batch = rows[i: i + batch_size]
-        ids = [str(r["id"]) for r in batch]
         texts = [_row_to_text(r) for r in batch]
-        embeddings = model.encode(texts, batch_size=64, show_progress_bar=False).tolist()
-        metadatas = [{"id": r["id"]} for r in batch]
-        col.upsert(ids=ids, embeddings=embeddings, documents=texts, metadatas=metadatas)
+        embeddings = embed_texts(texts, batch_size=64)
+
+        actions = []
+        for row, emb in zip(batch, embeddings):
+            doc = {k: v for k, v in row.items() if v is not None}
+            doc["embedding"] = emb
+            actions.append({
+                "_index": IDX_PROPERTIES,
+                "_id": str(row["id"]),
+                "_source": doc,
+            })
+        bulk(es, actions)
+
+    es.indices.refresh(index=IDX_PROPERTIES)
     print(f"[VectorSearch] Indexed {len(rows)} properties.")
 
 
 def delete_from_index(prop_id: int):
-    col, _ = _get_chroma()
-    if col:
-        try:
-            col.delete(ids=[str(prop_id)])
-        except Exception:
-            pass
+    es = get_es()
+    try:
+        es.delete(index=IDX_PROPERTIES, id=str(prop_id))
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
-# Full-text + structured filter search (SQLite FTS5)
+# Full-text search + structured filter
 # ---------------------------------------------------------------------------
 
-def _build_fts_query(query: str) -> str:
-    """Chuẩn hóa query thành FTS5 match expression."""
-    tokens = re.findall(r'\w+', query, re.UNICODE)
-    if not tokens:
-        return '""'
-    # Mỗi token tìm prefix match, tất cả phải xuất hiện (AND mặc định FTS5)
-    return " ".join(f'"{t}"*' for t in tokens)
+def _build_filters(filters: Optional[dict]) -> list[dict]:
+    f = filters or {}
+    must_filters = []
+
+    if f.get("loai"):
+        must_filters.append({"term": {"loai": f["loai"]}})
+    if f.get("trang_thai"):
+        must_filters.append({"term": {"trang_thai": f["trang_thai"]}})
+    if f.get("tinh_thanh"):
+        must_filters.append({"match": {"tinh_thanh": f["tinh_thanh"]}})
+    if f.get("quan_huyen"):
+        must_filters.append({"match": {"quan_huyen": f["quan_huyen"]}})
+    if f.get("gia_ban_min") is not None or f.get("gia_ban_max") is not None:
+        rng = {}
+        if f.get("gia_ban_min") is not None: rng["gte"] = f["gia_ban_min"]
+        if f.get("gia_ban_max") is not None: rng["lte"] = f["gia_ban_max"]
+        must_filters.append({"range": {"gia_ban": rng}})
+    if f.get("gia_thue_min") is not None or f.get("gia_thue_max") is not None:
+        rng = {}
+        if f.get("gia_thue_min") is not None: rng["gte"] = f["gia_thue_min"]
+        if f.get("gia_thue_max") is not None: rng["lte"] = f["gia_thue_max"]
+        must_filters.append({"range": {"gia_thue": rng}})
+    if f.get("dien_tich_min") is not None or f.get("dien_tich_max") is not None:
+        rng = {}
+        if f.get("dien_tich_min") is not None: rng["gte"] = f["dien_tich_min"]
+        if f.get("dien_tich_max") is not None: rng["lte"] = f["dien_tich_max"]
+        # OR giữa dien_tich_san và dien_tich_dat
+        must_filters.append({
+            "bool": {
+                "should": [
+                    {"range": {"dien_tich_san": rng}},
+                    {"range": {"dien_tich_dat": rng}},
+                ],
+                "minimum_should_match": 1,
+            }
+        })
+    if f.get("so_phong_ngu_min") is not None:
+        must_filters.append({"range": {"so_phong_ngu": {"gte": f["so_phong_ngu_min"]}}})
+    if f.get("phap_ly"):
+        must_filters.append({"term": {"phap_ly": f["phap_ly"]}})
+
+    return must_filters
 
 
-def fts_search(
-    query: str,
-    filters: Optional[dict] = None,
-    top_k: int = 30,
-    conn: Optional[sqlite3.Connection] = None,
-) -> list[dict]:
-    """
-    Full-text search + structured filter trên SQLite.
-    filters: dict với các key = tên cột, value = giá trị hoặc (min, max).
-    """
-    close_after = conn is None
-    if conn is None:
-        conn = get_connection()
+def fts_search(query: str, filters: Optional[dict] = None, top_k: int = 30) -> list[dict]:
+    """Full-text search + structured filter trên Elasticsearch."""
+    es = get_es()
+    must_filters = _build_filters(filters)
+
+    body = {
+        "size": top_k,
+        "query": {
+            "bool": {
+                "filter": must_filters,
+            }
+        },
+    }
+
+    if query.strip():
+        body["query"]["bool"]["must"] = [{
+            "multi_match": {
+                "query": query,
+                "fields": _TEXT_FIELDS,
+                "fuzziness": "AUTO",
+            }
+        }]
+    else:
+        body["query"]["bool"]["must"] = [{"match_all": {}}]
 
     try:
-        params = []
-        conditions = []
-
-        # FTS match (nếu có query text)
-        if query.strip():
-            fts_q = _build_fts_query(query)
-            base = """
-                SELECT p.*, fts.rank AS fts_rank
-                FROM properties_fts fts
-                JOIN properties p ON p.id = fts.id
-                WHERE properties_fts MATCH ?
-            """
-            params.append(fts_q)
-        else:
-            base = "SELECT p.*, 0 AS fts_rank FROM properties p WHERE 1=1"
-
-        # Structured filters
-        f = filters or {}
-        if f.get("loai"):
-            conditions.append("p.loai = ?")
-            params.append(f["loai"])
-        if f.get("trang_thai"):
-            conditions.append("p.trang_thai = ?")
-            params.append(f["trang_thai"])
-        if f.get("tinh_thanh"):
-            conditions.append("p.tinh_thanh LIKE ?")
-            params.append(f"%{f['tinh_thanh']}%")
-        if f.get("quan_huyen"):
-            conditions.append("p.quan_huyen LIKE ?")
-            params.append(f"%{f['quan_huyen']}%")
-        if f.get("gia_ban_min") is not None:
-            conditions.append("p.gia_ban >= ?")
-            params.append(f["gia_ban_min"])
-        if f.get("gia_ban_max") is not None:
-            conditions.append("p.gia_ban <= ?")
-            params.append(f["gia_ban_max"])
-        if f.get("gia_thue_min") is not None:
-            conditions.append("p.gia_thue >= ?")
-            params.append(f["gia_thue_min"])
-        if f.get("gia_thue_max") is not None:
-            conditions.append("p.gia_thue <= ?")
-            params.append(f["gia_thue_max"])
-        if f.get("dien_tich_min") is not None:
-            conditions.append("(p.dien_tich_san >= ? OR p.dien_tich_dat >= ?)")
-            params.extend([f["dien_tich_min"], f["dien_tich_min"]])
-        if f.get("dien_tich_max") is not None:
-            conditions.append("(p.dien_tich_san <= ? OR p.dien_tich_dat <= ?)")
-            params.extend([f["dien_tich_max"], f["dien_tich_max"]])
-        if f.get("so_phong_ngu_min") is not None:
-            conditions.append("p.so_phong_ngu >= ?")
-            params.append(f["so_phong_ngu_min"])
-        if f.get("phap_ly"):
-            conditions.append("p.phap_ly = ?")
-            params.append(f["phap_ly"])
-
-        where_extra = (" AND " + " AND ".join(conditions)) if conditions else ""
-        sql = f"{base}{where_extra} ORDER BY fts_rank LIMIT ?"
-        params.append(top_k)
-
-        rows = conn.execute(sql, params).fetchall()
-        return [dict(r) for r in rows]
-
+        resp = es.search(index=IDX_PROPERTIES, body=body)
+        return [hit["_source"] for hit in resp["hits"]["hits"]]
     except Exception as e:
         print(f"[FTSSearch] Error: {e}")
         return []
-    finally:
-        if close_after:
-            conn.close()
 
 
-def vector_search(query: str, top_k: int = 30) -> list[dict]:
-    """Tìm kiếm ngữ nghĩa bằng ChromaDB."""
-    col, model = _get_chroma()
-    if col is None or col.count() == 0:
-        return []
+def vector_search(query: str, top_k: int = 30, filters: Optional[dict] = None) -> list[dict]:
+    """Vector kNN search trên Elasticsearch."""
+    es = get_es()
+    embedding = embed_text(query)
+    must_filters = _build_filters(filters)
+
+    knn = {
+        "field": "embedding",
+        "query_vector": embedding,
+        "k": top_k,
+        "num_candidates": max(top_k * 4, 100),
+    }
+    if must_filters:
+        knn["filter"] = {"bool": {"filter": must_filters}}
+
     try:
-        embedding = model.encode(query).tolist()
-        results = col.query(
-            query_embeddings=[embedding],
-            n_results=min(top_k, col.count()),
-            include=["metadatas", "distances"],
-        )
-        ids = [int(m["id"]) for m in results["metadatas"][0]]
-        distances = results["distances"][0]
-
-        if not ids:
-            return []
-
-        conn = get_connection()
-        placeholders = ",".join("?" * len(ids))
-        rows = conn.execute(
-            f"SELECT * FROM properties WHERE id IN ({placeholders})", ids
-        ).fetchall()
-        conn.close()
-
-        id_to_row = {r["id"]: dict(r) for r in rows}
-        # Gắn điểm distance để dùng khi RRF
-        ordered = []
-        for pid, dist in zip(ids, distances):
-            if pid in id_to_row:
-                r = id_to_row[pid].copy()
-                r["_vector_dist"] = dist
-                ordered.append(r)
-        return ordered
-
+        resp = es.search(index=IDX_PROPERTIES, knn=knn, size=top_k)
+        return [hit["_source"] for hit in resp["hits"]["hits"]]
     except Exception as e:
         print(f"[VectorSearch] Error: {e}")
         return []
 
 
 # ---------------------------------------------------------------------------
-# Reciprocal Rank Fusion (RRF) merge
+# Reciprocal Rank Fusion (RRF) merge — thủ công để tương thích mọi version ES
 # ---------------------------------------------------------------------------
 
 def hybrid_search(
@@ -276,53 +201,33 @@ def hybrid_search(
     top_k: int = 15,
     rrf_k: int = 60,
 ) -> list[dict]:
-    """
-    Merge kết quả FTS và Vector bằng RRF.
-    Score RRF = 1/(rrf_k + rank_fts) + 1/(rrf_k + rank_vector)
-    """
+    """Merge kết quả FTS và Vector bằng RRF."""
     fts_results = fts_search(query, filters=filters, top_k=top_k * 2)
-    vec_results = vector_search(query, top_k=top_k * 2)
+    vec_results = vector_search(query, top_k=top_k * 2, filters=filters)
 
     scores: dict[int, float] = {}
+    all_rows: dict[int, dict] = {}
 
     for rank, row in enumerate(fts_results):
         pid = row["id"]
         scores[pid] = scores.get(pid, 0) + 1.0 / (rrf_k + rank + 1)
+        all_rows[pid] = row
 
     for rank, row in enumerate(vec_results):
         pid = row["id"]
         scores[pid] = scores.get(pid, 0) + 1.0 / (rrf_k + rank + 1)
+        all_rows.setdefault(pid, row)
 
     if not scores:
         return []
 
-    # Lấy data đầy đủ cho top-K ids theo RRF score
     sorted_ids = sorted(scores, key=lambda x: scores[x], reverse=True)[:top_k]
-
-    # Merge data từ hai nguồn
-    all_rows: dict[int, dict] = {}
-    for r in fts_results + vec_results:
-        all_rows[r["id"]] = r
-
-    # Với id không có trong cache, fetch từ DB
-    missing = [pid for pid in sorted_ids if pid not in all_rows]
-    if missing:
-        conn = get_connection()
-        placeholders = ",".join("?" * len(missing))
-        rows = conn.execute(
-            f"SELECT * FROM properties WHERE id IN ({placeholders})", missing
-        ).fetchall()
-        conn.close()
-        for r in rows:
-            all_rows[r["id"]] = dict(r)
 
     result = []
     for pid in sorted_ids:
-        if pid in all_rows:
-            row = all_rows[pid].copy()
-            row["_rrf_score"] = round(scores[pid], 6)
-            result.append(row)
-
+        row = all_rows[pid].copy()
+        row["_rrf_score"] = round(scores[pid], 6)
+        result.append(row)
     return result
 
 
@@ -346,7 +251,7 @@ def format_properties_for_prompt(properties: list[dict]) -> str:
             dt_info.append(f"Đất {p['dien_tich_dat']} m²")
 
         line = (
-            f"[{i}] **{p.get('ten', 'N/A')}** (ID: {p['ma_bds']})\n"
+            f"[{i}] **{p.get('ten', 'N/A')}** (ID: {p.get('ma_bds', p.get('id'))})\n"
             f"    • Loại: {p.get('loai','?')} | Trạng thái: {p.get('trang_thai','?')}\n"
             f"    • Địa chỉ: {p.get('dia_chi','?')}, {p.get('quan_huyen') or ''} {p.get('tinh_thanh','')}\n"
         )

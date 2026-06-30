@@ -113,13 +113,14 @@ async def import_csv(file: UploadFile = File(...)):
 
 @router.post("/import/reindex")
 async def reindex_all():
-    """Re-index toàn bộ BĐS vào vector store (dùng khi mới setup)."""
-    from app.database import get_connection
+    """Re-index toàn bộ BĐS vào Elasticsearch (rebuild embeddings)."""
+    from app.es_client import get_es, IDX_PROPERTIES
     from app.services.search import index_properties_batch
-    conn = get_connection()
-    rows = [dict(r) for r in conn.execute("SELECT * FROM properties").fetchall()]
-    conn.close()
+
+    es = get_es()
+    resp = es.search(index=IDX_PROPERTIES, query={"match_all": {}}, size=10000)
+    rows = [hit["_source"] for hit in resp["hits"]["hits"]]
     if not rows:
         return {"message": "Không có dữ liệu để index"}
     index_properties_batch(rows)
-    return {"message": f"Đã index {len(rows)} BĐS vào vector store"}
+    return {"message": f"Đã index {len(rows)} BĐS vào Elasticsearch"}

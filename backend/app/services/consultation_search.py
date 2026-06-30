@@ -1,67 +1,16 @@
 """
-Consultation Search Service
-===========================
-Vector store RIÊNG cho dữ liệu buổi tư vấn — tách biệt với BĐS index.
-
-Mỗi "document" trong vector store là một CHUNK của transcript hoặc
-một SESSION summary (metadata CRM), cho phép tìm các case tương tự
-theo ngữ nghĩa câu hỏi của khách hàng.
+Consultation Search Service — Elasticsearch
+=============================================
+Hai index riêng: consultation_sessions (metadata CRM) và transcript_chunks
+(từng đoạn hội thoại), cho phép tìm case tương tự theo ngữ nghĩa.
 """
-
-import re
-import json
-import threading
 from typing import Optional
-from pathlib import Path
 
-from app.database import get_connection, DB_PATH
+from app.es_client import get_es, IDX_SESSIONS, IDX_CHUNKS
+from app.embedding import embed_text, embed_texts
 
-_consult_collection = None
-_embed_model = None          # share với properties search nếu đã load
-_lock = threading.Lock()
-
-CHROMA_DIR = DB_PATH.parent / "chroma"
-EMBED_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
-
-
-def _get_collection():
-    global _consult_collection, _embed_model
-    with _lock:
-        if _consult_collection is not None:
-            return _consult_collection, _embed_model
-        try:
-            import chromadb
-            from chromadb.config import Settings
-            from sentence_transformers import SentenceTransformer
-
-            # Reuse model nếu properties search đã load
-            from app.services import search as prop_search
-            if prop_search._embed_model is not None:
-                _embed_model = prop_search._embed_model
-            else:
-                print("[ConsultSearch] Loading embedding model...")
-                _embed_model = SentenceTransformer(EMBED_MODEL_NAME)
-
-            CHROMA_DIR.mkdir(parents=True, exist_ok=True)
-            client = chromadb.PersistentClient(
-                path=str(CHROMA_DIR),
-                settings=Settings(anonymized_telemetry=False),
-            )
-            _consult_collection = client.get_or_create_collection(
-                name="consultations",
-                metadata={"hnsw:space": "cosine"},
-            )
-            print(f"[ConsultSearch] Ready. Collection size: {_consult_collection.count()}")
-            return _consult_collection, _embed_model
-        except ImportError as e:
-            print(f"[ConsultSearch] DISABLED – {e}")
-            return None, None
-
-
-# ─── Helpers ─────────────────────────────────────────────────────────────────
 
 def _session_to_text(session: dict) -> str:
-    """Tạo văn bản đại diện cho một session (dùng để embed)."""
     parts = []
     if session.get("loai_nhu_cau"):
         parts.append(f"Nhu cầu: {session['loai_nhu_cau']}")
@@ -94,165 +43,178 @@ def _chunk_to_text(chunk: dict) -> str:
 # ─── Index functions ──────────────────────────────────────────────────────────
 
 def index_session(session: dict):
-    """Index 1 session (metadata CRM) vào vector store."""
-    col, model = _get_collection()
-    if col is None:
-        return
+    es = get_es()
     text = _session_to_text(session)
-    if not text.strip():
-        return
-    embedding = model.encode(text).tolist()
-    col.upsert(
-        ids=[f"session_{session['id']}"],
-        embeddings=[embedding],
-        documents=[text],
-        metadatas=[{
-            "type": "session",
-            "session_id": session["id"],
-            "ket_qua": session.get("ket_qua") or "",
-            "loai_nhu_cau": session.get("loai_nhu_cau") or "",
-        }],
-    )
-
-
-def index_chunk(chunk: dict):
-    """Index 1 transcript chunk vào vector store."""
-    col, model = _get_collection()
-    if col is None:
-        return
-    text = _chunk_to_text(chunk)
-    embedding = model.encode(text).tolist()
-    col.upsert(
-        ids=[f"chunk_{chunk['id']}"],
-        embeddings=[embedding],
-        documents=[text],
-        metadatas=[{
-            "type": "chunk",
-            "chunk_id": chunk["id"],
-            "session_id": chunk["session_id"],
-            "speaker": chunk.get("speaker") or "unknown",
-        }],
-    )
-
-
-def index_chunks_batch(chunks: list[dict], batch_size: int = 500):
-    col, model = _get_collection()
-    if col is None or not chunks:
-        return
-    for i in range(0, len(chunks), batch_size):
-        batch = chunks[i: i + batch_size]
-        ids = [f"chunk_{c['id']}" for c in batch]
-        texts = [_chunk_to_text(c) for c in batch]
-        embeddings = model.encode(texts, batch_size=64, show_progress_bar=False).tolist()
-        metadatas = [{
-            "type": "chunk",
-            "chunk_id": c["id"],
-            "session_id": c["session_id"],
-            "speaker": c.get("speaker") or "unknown",
-        } for c in batch]
-        col.upsert(ids=ids, embeddings=embeddings, documents=texts, metadatas=metadatas)
-    print(f"[ConsultSearch] Indexed {len(chunks)} chunks.")
+    doc = {k: v for k, v in session.items() if v is not None}
+    if text.strip():
+        doc["embedding"] = embed_text(text)
+    es.index(index=IDX_SESSIONS, id=str(session["id"]), document=doc)
 
 
 def index_sessions_batch(sessions: list[dict], batch_size: int = 500):
-    col, model = _get_collection()
-    if col is None or not sessions:
+    from elasticsearch.helpers import bulk
+    es = get_es()
+    if not sessions:
         return
+
     for i in range(0, len(sessions), batch_size):
         batch = sessions[i: i + batch_size]
-        ids = [f"session_{s['id']}" for s in batch]
         texts = [_session_to_text(s) for s in batch]
-        embeddings = model.encode(texts, batch_size=64, show_progress_bar=False).tolist()
-        metadatas = [{
-            "type": "session",
-            "session_id": s["id"],
-            "ket_qua": s.get("ket_qua") or "",
-            "loai_nhu_cau": s.get("loai_nhu_cau") or "",
-        } for s in batch]
-        col.upsert(ids=ids, embeddings=embeddings, documents=texts, metadatas=metadatas)
+        embeddings = embed_texts(texts, batch_size=64)
+
+        actions = []
+        for s, emb in zip(batch, embeddings):
+            doc = {k: v for k, v in s.items() if v is not None}
+            doc["embedding"] = emb
+            actions.append({"_index": IDX_SESSIONS, "_id": str(s["id"]), "_source": doc})
+        bulk(es, actions)
+
+    es.indices.refresh(index=IDX_SESSIONS)
     print(f"[ConsultSearch] Indexed {len(sessions)} sessions.")
 
 
+def index_chunk(chunk: dict):
+    es = get_es()
+    text = _chunk_to_text(chunk)
+    doc = {k: v for k, v in chunk.items() if v is not None}
+    doc["embedding"] = embed_text(text)
+    es.index(index=IDX_CHUNKS, id=str(chunk["id"]), document=doc)
+
+
+def index_chunks_batch(chunks: list[dict], batch_size: int = 500):
+    from elasticsearch.helpers import bulk
+    es = get_es()
+    if not chunks:
+        return
+
+    for i in range(0, len(chunks), batch_size):
+        batch = chunks[i: i + batch_size]
+        texts = [_chunk_to_text(c) for c in batch]
+        embeddings = embed_texts(texts, batch_size=64)
+
+        actions = []
+        for c, emb in zip(batch, embeddings):
+            doc = {k: v for k, v in c.items() if v is not None}
+            doc["embedding"] = emb
+            actions.append({"_index": IDX_CHUNKS, "_id": str(c["id"]), "_source": doc})
+        bulk(es, actions)
+
+    es.indices.refresh(index=IDX_CHUNKS)
+    print(f"[ConsultSearch] Indexed {len(chunks)} chunks.")
+
+
 def delete_session_from_index(session_id: int):
-    col, _ = _get_collection()
-    if col:
-        try:
-            col.delete(where={"session_id": session_id})
-        except Exception:
-            pass
+    es = get_es()
+    try:
+        es.delete(index=IDX_SESSIONS, id=str(session_id))
+    except Exception:
+        pass
+    try:
+        es.delete_by_query(
+            index=IDX_CHUNKS,
+            query={"term": {"session_id": session_id}},
+        )
+    except Exception:
+        pass
+
+
+def delete_chunks_for_session(session_id: int):
+    es = get_es()
+    try:
+        es.delete_by_query(
+            index=IDX_CHUNKS,
+            query={"term": {"session_id": session_id}},
+        )
+    except Exception:
+        pass
 
 
 # ─── Search functions ─────────────────────────────────────────────────────────
 
-def _fts_build_query(q: str) -> str:
-    tokens = re.findall(r'\w+', q, re.UNICODE)
-    return " ".join(f'"{t}"*' for t in tokens) if tokens else '""'
-
-
 def fts_search_consultations(query: str, top_k: int = 20, ket_qua: str = None) -> list[dict]:
-    """Full-text search transcript_chunks + filter theo kết quả session."""
-    conn = get_connection()
+    """Full-text search trên transcript_chunks."""
+    es = get_es()
+    filt = []
+    if ket_qua:
+        filt.append({"term": {"_ket_qua": ket_qua}})  # placeholder, join thủ công bên dưới
+
+    body_query = {"bool": {"filter": []}}
+    if query.strip():
+        body_query["bool"]["must"] = [{"match": {"content": query}}]
+    else:
+        body_query["bool"]["must"] = [{"match_all": {}}]
+
     try:
-        params = []
-        if query.strip():
-            fq = _fts_build_query(query)
-            sql = """
-                SELECT tc.*, cs.ket_qua, cs.loai_nhu_cau, cs.khu_vuc_quan_tam,
-                       cs.ngan_sach_min, cs.ngan_sach_max, cs.nguoi_tu_van,
-                       fts.rank AS fts_rank
-                FROM transcript_fts fts
-                JOIN transcript_chunks tc ON tc.id = fts.id
-                JOIN consultation_sessions cs ON cs.id = tc.session_id
-                WHERE transcript_fts MATCH ?
-            """
-            params.append(fq)
-        else:
-            sql = """
-                SELECT tc.*, cs.ket_qua, cs.loai_nhu_cau, cs.khu_vuc_quan_tam,
-                       cs.ngan_sach_min, cs.ngan_sach_max, cs.nguoi_tu_van, 0 AS fts_rank
-                FROM transcript_chunks tc
-                JOIN consultation_sessions cs ON cs.id = tc.session_id
-                WHERE 1=1
-            """
-        if ket_qua:
-            sql += " AND cs.ket_qua = ?"
-            params.append(ket_qua)
-        sql += " ORDER BY fts_rank LIMIT ?"
-        params.append(top_k)
-        rows = conn.execute(sql, params).fetchall()
-        return [dict(r) for r in rows]
+        resp = es.search(index=IDX_CHUNKS, query=body_query, size=top_k)
+        chunks = [hit["_source"] for hit in resp["hits"]["hits"]]
     except Exception as e:
         print(f"[FTS Consult] Error: {e}")
         return []
-    finally:
-        conn.close()
+
+    if not chunks:
+        return chunks
+
+    # Join thêm metadata session
+    session_ids = list({c.get("session_id") for c in chunks if c.get("session_id")})
+    session_map = _fetch_sessions_by_ids(session_ids)
+
+    out = []
+    for c in chunks:
+        sess = session_map.get(c.get("session_id"), {})
+        if ket_qua and sess.get("ket_qua") != ket_qua:
+            continue
+        merged = {**c}
+        merged["ket_qua"] = sess.get("ket_qua")
+        merged["loai_nhu_cau"] = sess.get("loai_nhu_cau")
+        merged["khu_vuc_quan_tam"] = sess.get("khu_vuc_quan_tam")
+        merged["ngan_sach_min"] = sess.get("ngan_sach_min")
+        merged["ngan_sach_max"] = sess.get("ngan_sach_max")
+        merged["nguoi_tu_van"] = sess.get("nguoi_tu_van")
+        out.append(merged)
+    return out
 
 
-def vector_search_consultations(query: str, top_k: int = 20, doc_type: str = None) -> list[dict]:
-    """Vector search trên consultation collection."""
-    col, model = _get_collection()
-    if col is None or col.count() == 0:
-        return []
+def vector_search_consultations(query: str, top_k: int = 20, doc_type: str = "chunk") -> list[dict]:
+    """Vector kNN search trên chunk hoặc session collection."""
+    es = get_es()
+    embedding = embed_text(query)
+    index_name = IDX_CHUNKS if doc_type == "chunk" else IDX_SESSIONS
+
+    knn = {
+        "field": "embedding",
+        "query_vector": embedding,
+        "k": top_k,
+        "num_candidates": max(top_k * 4, 100),
+    }
+
     try:
-        embedding = model.encode(query).tolist()
-        where = {"type": doc_type} if doc_type else None
-        results = col.query(
-            query_embeddings=[embedding],
-            n_results=min(top_k, col.count()),
-            include=["metadatas", "distances", "documents"],
-            where=where,
-        )
+        resp = es.search(index=index_name, knn=knn, size=top_k)
         out = []
-        for meta, dist, doc in zip(
-            results["metadatas"][0],
-            results["distances"][0],
-            results["documents"][0],
-        ):
-            out.append({**meta, "_dist": dist, "_doc": doc})
+        for hit in resp["hits"]["hits"]:
+            src = hit["_source"]
+            if doc_type == "chunk":
+                out.append({**src, "chunk_id": src.get("id"), "_dist": 1 - hit["_score"]})
+            else:
+                out.append({**src, "session_id": src.get("id"), "_dist": 1 - hit["_score"]})
         return out
     except Exception as e:
         print(f"[Vector Consult] Error: {e}")
         return []
+
+
+def _fetch_sessions_by_ids(session_ids: list[int]) -> dict[int, dict]:
+    if not session_ids:
+        return {}
+    es = get_es()
+    try:
+        resp = es.search(
+            index=IDX_SESSIONS,
+            query={"terms": {"id": session_ids}},
+            size=len(session_ids),
+        )
+        return {hit["_source"]["id"]: hit["_source"] for hit in resp["hits"]["hits"]}
+    except Exception:
+        return {}
 
 
 def hybrid_search_consultations(
@@ -261,17 +223,11 @@ def hybrid_search_consultations(
     rrf_k: int = 60,
     ket_qua_filter: str = None,
 ) -> tuple[list[dict], list[dict]]:
-    """
-    Hybrid search trên lịch sử tư vấn.
-    Trả về (similar_chunks, similar_sessions) — 2 loại context khác nhau.
-    """
-    # FTS trên transcript chunks
+    """Hybrid search trên lịch sử tư vấn. Trả về (chunks, sessions)."""
     fts_chunks = fts_search_consultations(query, top_k=top_k * 2, ket_qua=ket_qua_filter)
-    # Vector trên chunks + sessions
     vec_chunks = vector_search_consultations(query, top_k=top_k * 2, doc_type="chunk")
     vec_sessions = vector_search_consultations(query, top_k=top_k, doc_type="session")
 
-    # RRF merge chunks
     scores: dict = {}
     chunk_data: dict = {}
 
@@ -285,37 +241,20 @@ def hybrid_search_consultations(
         if cid:
             key = f"c_{cid}"
             scores[key] = scores.get(key, 0) + 1.0 / (rrf_k + rank + 1)
-            if key not in chunk_data:
-                chunk_data[key] = c
+            chunk_data.setdefault(key, c)
 
     top_chunks_keys = sorted(scores, key=lambda x: scores[x], reverse=True)[:top_k]
     top_chunks = [chunk_data[k] for k in top_chunks_keys if k in chunk_data]
 
-    # Lấy thêm session metadata cho các session liên quan
     session_ids = list({c.get("session_id") for c in top_chunks if c.get("session_id")})
-    sessions = []
-    if session_ids:
-        conn = get_connection()
-        placeholders = ",".join("?" * len(session_ids))
-        rows = conn.execute(
-            f"SELECT * FROM consultation_sessions WHERE id IN ({placeholders})",
-            session_ids,
-        ).fetchall()
-        conn.close()
-        sessions = [dict(r) for r in rows]
+    session_map = _fetch_sessions_by_ids(session_ids)
+    sessions = list(session_map.values())
 
-    # Merge sessions từ vector search
     vec_session_ids = {s.get("session_id") for s in vec_sessions if s.get("session_id")}
     extra_ids = vec_session_ids - set(session_ids)
     if extra_ids:
-        conn = get_connection()
-        placeholders = ",".join("?" * len(extra_ids))
-        rows = conn.execute(
-            f"SELECT * FROM consultation_sessions WHERE id IN ({placeholders})",
-            list(extra_ids),
-        ).fetchall()
-        conn.close()
-        sessions.extend([dict(r) for r in rows])
+        extra_map = _fetch_sessions_by_ids(list(extra_ids))
+        sessions.extend(extra_map.values())
 
     return top_chunks[:top_k], sessions[:top_k]
 
@@ -323,19 +262,16 @@ def hybrid_search_consultations(
 # ─── Format context cho prompt ────────────────────────────────────────────────
 
 def format_consultation_context(chunks: list[dict], sessions: list[dict]) -> str:
-    """Tạo context từ lịch sử tư vấn để inject vào system prompt."""
     if not chunks and not sessions:
         return ""
 
     lines = ["## KINH NGHIỆM TỪ CÁC BUỔI TƯ VẤN TRƯỚC (dữ liệu công ty)\n"]
 
-    # Group chunks theo session
     session_chunks: dict[int, list] = {}
     for c in chunks:
         sid = c.get("session_id", 0)
         session_chunks.setdefault(sid, []).append(c)
 
-    # Lấy session metadata
     session_map = {s["id"]: s for s in sessions}
 
     shown = 0
@@ -352,8 +288,8 @@ def format_consultation_context(chunks: list[dict], sessions: list[dict]) -> str
 
         header = f"### Case #{sid}"
         meta = []
-        if loai:     meta.append(loai)
-        if khu_vuc:  meta.append(khu_vuc)
+        if loai: meta.append(loai)
+        if khu_vuc: meta.append(khu_vuc)
         if ngan_sach: meta.append(ngan_sach)
         meta.append(f"→ **{ket_qua}**")
         lines.append(f"{header} | {' | '.join(meta)}")
@@ -367,7 +303,6 @@ def format_consultation_context(chunks: list[dict], sessions: list[dict]) -> str
         lines.append("")
         shown += 1
 
-    # Sessions không có chunk (từ vector search thuần)
     for sess in sessions:
         if sess["id"] in session_chunks:
             continue
@@ -390,7 +325,5 @@ def format_consultation_context(chunks: list[dict], sessions: list[dict]) -> str
     if shown == 0:
         return ""
 
-    lines.append(
-        "_Hãy học từ các case trên: sử dụng cách tiếp cận hiệu quả, tránh lỗi đã gặp._"
-    )
+    lines.append("_Hãy học từ các case trên: sử dụng cách tiếp cận hiệu quả, tránh lỗi đã gặp._")
     return "\n".join(lines)

@@ -1,96 +1,73 @@
 """
-Consultation Service — CRUD + Import + Analytics + AI Analysis
+Consultation Service — CRUD + Import + Analytics — Elasticsearch
 """
-import csv
-import io
-import json
+from datetime import datetime
 from typing import Optional
-from app.database import get_connection
+
+from app.es_client import get_es, IDX_SESSIONS, IDX_CHUNKS, next_id
 from app.services.consultation_search import (
     index_session, index_chunk, index_chunks_batch, index_sessions_batch,
-    delete_session_from_index,
+    delete_session_from_index, delete_chunks_for_session,
 )
+
+_now = lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 # ─── CRUD Sessions ────────────────────────────────────────────────────────────
 
 def create_session(data: dict) -> dict:
-    conn = get_connection()
+    sid = next_id("consultation_sessions")
+    row = {
+        **data,
+        "id": sid,
+        "ket_qua": data.get("ket_qua") or "Chưa chốt",
+        "co_transcript": 0,
+        "created_at": _now(),
+        "updated_at": _now(),
+    }
     try:
-        cols = ", ".join(data.keys())
-        placeholders = ", ".join("?" * len(data))
-        cur = conn.execute(
-            f"INSERT INTO consultation_sessions ({cols}) VALUES ({placeholders})",
-            list(data.values()),
-        )
-        conn.commit()
-        sid = cur.lastrowid
-        row = dict(conn.execute(
-            "SELECT * FROM consultation_sessions WHERE id = ?", (sid,)
-        ).fetchone())
-        try:
-            index_session(row)
-        except Exception:
-            pass
-        return row
-    finally:
-        conn.close()
+        index_session(row)
+    except Exception:
+        pass
+    get_es().indices.refresh(index=IDX_SESSIONS)
+    return row
 
 
 def get_session(session_id: int) -> Optional[dict]:
-    conn = get_connection()
+    es = get_es()
     try:
-        row = conn.execute(
-            "SELECT * FROM consultation_sessions WHERE id = ?", (session_id,)
-        ).fetchone()
-        return dict(row) if row else None
-    finally:
-        conn.close()
+        doc = es.get(index=IDX_SESSIONS, id=str(session_id))
+        return doc["_source"]
+    except Exception:
+        return None
 
 
 def update_session(session_id: int, data: dict) -> Optional[dict]:
-    conn = get_connection()
-    try:
-        clean = {k: v for k, v in data.items() if v is not None}
-        if not clean:
-            return get_session(session_id)
-        set_clause = ", ".join(f"{k} = ?" for k in clean)
-        conn.execute(
-            f"UPDATE consultation_sessions SET {set_clause} WHERE id = ?",
-            list(clean.values()) + [session_id],
-        )
-        conn.commit()
-        row = conn.execute(
-            "SELECT * FROM consultation_sessions WHERE id = ?", (session_id,)
-        ).fetchone()
-        if row:
-            r = dict(row)
-            try:
-                index_session(r)
-            except Exception:
-                pass
-            return r
+    existing = get_session(session_id)
+    if not existing:
         return None
-    finally:
-        conn.close()
+    clean = {k: v for k, v in data.items() if v is not None}
+    if not clean:
+        return existing
+    merged = {**existing, **clean, "id": session_id, "updated_at": _now()}
+    try:
+        index_session(merged)
+    except Exception:
+        pass
+    get_es().indices.refresh(index=IDX_SESSIONS)
+    return merged
 
 
 def delete_session(session_id: int) -> bool:
-    conn = get_connection()
-    try:
-        cur = conn.execute(
-            "DELETE FROM consultation_sessions WHERE id = ?", (session_id,)
-        )
-        conn.commit()
-        if cur.rowcount > 0:
-            try:
-                delete_session_from_index(session_id)
-            except Exception:
-                pass
-            return True
+    if not get_session(session_id):
         return False
-    finally:
-        conn.close()
+    try:
+        delete_session_from_index(session_id)
+        get_es().indices.refresh(index=IDX_SESSIONS)
+        get_es().indices.refresh(index=IDX_CHUNKS)
+        return True
+    except Exception:
+        return False
 
 
 def list_sessions(
@@ -105,97 +82,94 @@ def list_sessions(
     sort_by: str = "created_at",
     sort_dir: str = "desc",
 ) -> dict:
-    conn = get_connection()
-    try:
-        conds, params = [], []
-        if ket_qua:
-            conds.append("ket_qua = ?"); params.append(ket_qua)
-        if nguoi_tu_van:
-            conds.append("nguoi_tu_van LIKE ?"); params.append(f"%{nguoi_tu_van}%")
-        if loai_nhu_cau:
-            conds.append("loai_nhu_cau = ?"); params.append(loai_nhu_cau)
-        if khu_vuc:
-            conds.append("khu_vuc_quan_tam LIKE ?"); params.append(f"%{khu_vuc}%")
-        if tu_ngay:
-            conds.append("created_at >= ?"); params.append(tu_ngay)
-        if den_ngay:
-            conds.append("created_at <= ?"); params.append(den_ngay + " 23:59:59")
+    es = get_es()
 
-        where = ("WHERE " + " AND ".join(conds)) if conds else ""
-        safe_sort = sort_by if sort_by in (
-            "created_at", "thoi_gian_bat_dau", "diem_chat_luong", "thoi_luong_phut"
-        ) else "created_at"
-        safe_dir = "ASC" if sort_dir.lower() == "asc" else "DESC"
+    filt = []
+    if ket_qua: filt.append({"term": {"ket_qua": ket_qua}})
+    if nguoi_tu_van: filt.append({"match": {"nguoi_tu_van": nguoi_tu_van}})
+    if loai_nhu_cau: filt.append({"term": {"loai_nhu_cau": loai_nhu_cau}})
+    if khu_vuc: filt.append({"match": {"khu_vuc_quan_tam": khu_vuc}})
+    if tu_ngay or den_ngay:
+        rng = {}
+        if tu_ngay: rng["gte"] = tu_ngay
+        if den_ngay: rng["lte"] = den_ngay + " 23:59:59"
+        filt.append({"range": {"created_at": rng}})
 
-        total = conn.execute(
-            f"SELECT COUNT(*) FROM consultation_sessions {where}", params
-        ).fetchone()[0]
-        offset = (page - 1) * page_size
-        rows = conn.execute(
-            f"SELECT * FROM consultation_sessions {where} "
-            f"ORDER BY {safe_sort} {safe_dir} LIMIT ? OFFSET ?",
-            params + [page_size, offset],
-        ).fetchall()
-        return {
-            "total": total,
-            "page": page,
-            "page_size": page_size,
-            "total_pages": (total + page_size - 1) // page_size,
-            "items": [dict(r) for r in rows],
-        }
-    finally:
-        conn.close()
+    query = {"bool": {"filter": filt}} if filt else {"match_all": {}}
+
+    safe_sort_map = {
+        "created_at": "created_at", "thoi_gian_bat_dau": "thoi_gian_bat_dau",
+        "diem_chat_luong": "diem_chat_luong", "thoi_luong_phut": "thoi_luong_phut",
+    }
+    sort_field = safe_sort_map.get(sort_by, "created_at")
+    sort_order = "asc" if sort_dir.lower() == "asc" else "desc"
+
+    offset = (page - 1) * page_size
+    resp = es.search(
+        index=IDX_SESSIONS,
+        query=query,
+        sort=[{sort_field: {"order": sort_order}}],
+        from_=offset,
+        size=page_size,
+        track_total_hits=True,
+    )
+
+    total = resp["hits"]["total"]["value"]
+    items = [hit["_source"] for hit in resp["hits"]["hits"]]
+
+    return {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": (total + page_size - 1) // page_size if total else 0,
+        "items": items,
+    }
 
 
 # ─── Transcript Chunks ────────────────────────────────────────────────────────
 
 def save_transcript_chunks(session_id: int, chunks: list[dict]) -> int:
-    """Lưu danh sách chunks, xóa cũ trước. Trả về số chunks đã lưu."""
-    conn = get_connection()
+    """Lưu danh sách chunks, xóa cũ trước."""
+    delete_chunks_for_session(session_id)
+
+    inserted = []
+    for idx, c in enumerate(chunks):
+        cid = next_id("transcript_chunks")
+        topics = c.get("topics", [])
+        topics_str = ", ".join(topics) if isinstance(topics, list) else (topics or "")
+        row = {
+            "id": cid,
+            "session_id": session_id,
+            "chunk_index": idx,
+            "speaker": c.get("speaker", "unknown"),
+            "content": c.get("content", ""),
+            "start_time": c.get("start_time"),
+            "end_time": c.get("end_time"),
+            "topics": topics_str,
+            "sentiment": c.get("sentiment"),
+            "created_at": _now(),
+        }
+        inserted.append(row)
+
     try:
-        conn.execute(
-            "DELETE FROM transcript_chunks WHERE session_id = ?", (session_id,)
-        )
-        inserted = []
-        for idx, c in enumerate(chunks):
-            cur = conn.execute(
-                """INSERT INTO transcript_chunks
-                   (session_id, chunk_index, speaker, content, start_time, end_time, topics, sentiment)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    session_id, idx,
-                    c.get("speaker", "unknown"),
-                    c.get("content", ""),
-                    c.get("start_time"),
-                    c.get("end_time"),
-                    json.dumps(c.get("topics", []), ensure_ascii=False) if isinstance(c.get("topics"), list) else c.get("topics"),
-                    c.get("sentiment"),
-                ),
-            )
-            inserted.append({"id": cur.lastrowid, "session_id": session_id, **c})
-        conn.execute(
-            "UPDATE consultation_sessions SET co_transcript=1 WHERE id=?", (session_id,)
-        )
-        conn.commit()
-        try:
-            index_chunks_batch(inserted)
-        except Exception:
-            pass
-        return len(inserted)
-    finally:
-        conn.close()
+        index_chunks_batch(inserted)
+    except Exception:
+        pass
+
+    update_session(session_id, {"co_transcript": 1})
+    get_es().indices.refresh(index=IDX_CHUNKS)
+    return len(inserted)
 
 
 def get_transcript(session_id: int) -> list[dict]:
-    conn = get_connection()
-    try:
-        rows = conn.execute(
-            "SELECT * FROM transcript_chunks WHERE session_id = ? ORDER BY chunk_index",
-            (session_id,),
-        ).fetchall()
-        return [dict(r) for r in rows]
-    finally:
-        conn.close()
+    es = get_es()
+    resp = es.search(
+        index=IDX_CHUNKS,
+        query={"term": {"session_id": session_id}},
+        sort=[{"chunk_index": {"order": "asc"}}],
+        size=1000,
+    )
+    return [hit["_source"] for hit in resp["hits"]["hits"]]
 
 
 # ─── Import ───────────────────────────────────────────────────────────────────
@@ -233,42 +207,33 @@ def import_sessions(records: list[dict]) -> dict:
     success, failed, errors = 0, 0, []
     inserted_sessions = []
 
-    conn = get_connection()
-    try:
-        for i, rec in enumerate(records):
-            try:
-                # Normalize keys
-                norm = {}
-                for k, v in rec.items():
-                    key = k.strip().lower().replace(" ", "_")
-                    mapped = _SESSION_ALIASES.get(key, key)
-                    if mapped in _ALLOWED_COLS and v is not None and str(v).strip() not in ("", "nan", "none", "null"):
-                        norm[mapped] = v
+    for i, rec in enumerate(records):
+        try:
+            norm = {}
+            for k, v in rec.items():
+                key = k.strip().lower().replace(" ", "_")
+                mapped = _SESSION_ALIASES.get(key, key)
+                if mapped in _ALLOWED_COLS and v is not None and str(v).strip() not in ("", "nan", "none", "null"):
+                    norm[mapped] = v
 
-                if not norm:
-                    failed += 1
-                    errors.append(f"Dòng {i+1}: Không có trường hợp lệ")
-                    continue
-
-                cols = ", ".join(norm.keys())
-                placeholders = ", ".join("?" * len(norm))
-                cur = conn.execute(
-                    f"INSERT OR IGNORE INTO consultation_sessions ({cols}) VALUES ({placeholders})",
-                    list(norm.values()),
-                )
-                if cur.lastrowid:
-                    inserted_sessions.append({"id": cur.lastrowid, **norm})
-                    success += 1
-                else:
-                    failed += 1
-                    errors.append(f"Dòng {i+1}: Trùng mã session hoặc lỗi")
-            except Exception as e:
+            if not norm:
                 failed += 1
-                errors.append(f"Dòng {i+1}: {str(e)[:100]}")
+                errors.append(f"Dòng {i+1}: Không có trường hợp lệ")
+                continue
 
-        conn.commit()
-    finally:
-        conn.close()
+            sid = next_id("consultation_sessions")
+            row = {
+                **norm, "id": sid,
+                "ket_qua": norm.get("ket_qua") or "Chưa chốt",
+                "co_transcript": 0,
+                "created_at": _now(),
+                "updated_at": _now(),
+            }
+            inserted_sessions.append(row)
+            success += 1
+        except Exception as e:
+            failed += 1
+            errors.append(f"Dòng {i+1}: {str(e)[:100]}")
 
     if inserted_sessions:
         try:
@@ -287,63 +252,47 @@ def import_sessions(records: list[dict]) -> dict:
 # ─── Analytics ────────────────────────────────────────────────────────────────
 
 def get_consultation_stats() -> dict:
-    conn = get_connection()
-    try:
-        total = conn.execute(
-            "SELECT COUNT(*) FROM consultation_sessions"
-        ).fetchone()[0]
+    es = get_es()
+    total = es.count(index=IDX_SESSIONS)["count"]
 
-        by_ket_qua = conn.execute(
-            "SELECT ket_qua, COUNT(*) cnt FROM consultation_sessions GROUP BY ket_qua ORDER BY cnt DESC"
-        ).fetchall()
+    agg_resp = es.search(
+        index=IDX_SESSIONS,
+        size=0,
+        aggs={
+            "by_ket_qua": {"terms": {"field": "ket_qua", "size": 10}},
+            "by_loai": {"terms": {"field": "loai_nhu_cau", "size": 10}},
+            "by_nguoi": {
+                "terms": {"field": "nguoi_tu_van.keyword", "size": 10},
+                "aggs": {
+                    "chot": {
+                        "filter": {"term": {"ket_qua": "Chốt giao dịch"}},
+                    }
+                },
+            },
+            "by_khu_vuc": {"terms": {"field": "khu_vuc_quan_tam.keyword", "size": 10}},
+            "avg_duration": {"avg": {"field": "thoi_luong_phut"}},
+            "avg_score": {"avg": {"field": "diem_chat_luong"}},
+            "ly_do": {"terms": {"field": "ly_do_tu_choi.keyword", "size": 5}},
+        },
+    )
+    aggs = agg_resp["aggregations"]
 
-        by_loai = conn.execute(
-            "SELECT loai_nhu_cau, COUNT(*) cnt FROM consultation_sessions "
-            "WHERE loai_nhu_cau IS NOT NULL GROUP BY loai_nhu_cau ORDER BY cnt DESC"
-        ).fetchall()
+    by_ket_qua = [{"ket_qua": b["key"], "cnt": b["doc_count"]} for b in aggs["by_ket_qua"]["buckets"]]
+    chot = next((r["cnt"] for r in by_ket_qua if r["ket_qua"] == "Chốt giao dịch"), 0)
+    ti_le_chot = round(chot / total * 100, 1) if total > 0 else 0
 
-        by_nguoi = conn.execute(
-            "SELECT nguoi_tu_van, COUNT(*) total, "
-            "SUM(CASE WHEN ket_qua='Chốt giao dịch' THEN 1 ELSE 0 END) chot "
-            "FROM consultation_sessions WHERE nguoi_tu_van IS NOT NULL "
-            "GROUP BY nguoi_tu_van ORDER BY total DESC LIMIT 10"
-        ).fetchall()
-
-        by_khu_vuc = conn.execute(
-            "SELECT khu_vuc_quan_tam, COUNT(*) cnt FROM consultation_sessions "
-            "WHERE khu_vuc_quan_tam IS NOT NULL GROUP BY khu_vuc_quan_tam ORDER BY cnt DESC LIMIT 10"
-        ).fetchall()
-
-        avg_duration = conn.execute(
-            "SELECT AVG(thoi_luong_phut) FROM consultation_sessions WHERE thoi_luong_phut > 0"
-        ).fetchone()[0]
-
-        avg_score = conn.execute(
-            "SELECT AVG(diem_chat_luong) FROM consultation_sessions WHERE diem_chat_luong IS NOT NULL"
-        ).fetchone()[0]
-
-        # Tỷ lệ chốt
-        chot = next((r["cnt"] for r in by_ket_qua if r["ket_qua"] == "Chốt giao dịch"), 0)
-        ti_le_chot = round(chot / total * 100, 1) if total > 0 else 0
-
-        # Lý do từ chối phổ biến
-        ly_do = conn.execute(
-            "SELECT ly_do_tu_choi, COUNT(*) cnt FROM consultation_sessions "
-            "WHERE ly_do_tu_choi IS NOT NULL AND ly_do_tu_choi != '' "
-            "GROUP BY ly_do_tu_choi ORDER BY cnt DESC LIMIT 5"
-        ).fetchall()
-
-        return {
-            "total": total,
-            "ti_le_chot": ti_le_chot,
-            "so_chot": chot,
-            "avg_duration_phut": round(avg_duration or 0, 1),
-            "avg_diem_chat_luong": round(avg_score or 0, 1),
-            "by_ket_qua": [dict(r) for r in by_ket_qua],
-            "by_loai_nhu_cau": [dict(r) for r in by_loai],
-            "by_nguoi_tu_van": [dict(r) for r in by_nguoi],
-            "by_khu_vuc": [dict(r) for r in by_khu_vuc],
-            "ly_do_tu_choi_pho_bien": [dict(r) for r in ly_do],
-        }
-    finally:
-        conn.close()
+    return {
+        "total": total,
+        "ti_le_chot": ti_le_chot,
+        "so_chot": chot,
+        "avg_duration_phut": round(aggs["avg_duration"]["value"] or 0, 1),
+        "avg_diem_chat_luong": round(aggs["avg_score"]["value"] or 0, 1),
+        "by_ket_qua": by_ket_qua,
+        "by_loai_nhu_cau": [{"loai_nhu_cau": b["key"], "cnt": b["doc_count"]} for b in aggs["by_loai"]["buckets"]],
+        "by_nguoi_tu_van": [
+            {"nguoi_tu_van": b["key"], "total": b["doc_count"], "chot": b["chot"]["doc_count"]}
+            for b in aggs["by_nguoi"]["buckets"]
+        ],
+        "by_khu_vuc": [{"khu_vuc_quan_tam": b["key"], "cnt": b["doc_count"]} for b in aggs["by_khu_vuc"]["buckets"]],
+        "ly_do_tu_choi_pho_bien": [{"ly_do_tu_choi": b["key"], "cnt": b["doc_count"]} for b in aggs["ly_do"]["buckets"]],
+    }

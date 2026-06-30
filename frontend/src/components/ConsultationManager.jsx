@@ -219,8 +219,8 @@ export default function ConsultationManager() {
 
   const downloadTemplate = () => {
     const csv = `ma_session,ten_kh,dien_thoai_kh,kenh_tiep_can,nguoi_tu_van,loai_nhu_cau,loai_bds_quan_tam,khu_vuc_quan_tam,ngan_sach_min,ngan_sach_max,tieu_chi_khac,ket_qua,ly_do_tu_choi,ghi_chu,thoi_gian_bat_dau,thoi_luong_phut
-TV001,Nguyễn Văn A,0901234567,Zalo,Trần Thị B,Mua,Căn hộ chung cư,Quận 2 TP.HCM,3000,5000,Gần trường học,Chốt giao dịch,,Khách hài lòng với Vinhomes,2024-01-15 09:00,45
-TV002,Lê Thị C,0912345678,Facebook,Nguyễn Văn D,Đầu tư,Đất nền,Nhơn Trạch Đồng Nai,500,1000,Gần KCN,Từ chối,Giá quá cao,Cần tư vấn thêm về pháp lý,2024-01-16 14:00,30`
+TV001,Nguyễn Văn A,0901234567,Zalo,Trần Thị B,Mua,Căn hộ chung cư,Quận 2 TP.HCM,3000,5000,Gần trường học,Chốt giao dịch,,Khách hài lòng với Vinhomes,2024-01-15 09:00:00,45
+TV002,Lê Thị C,0912345678,Facebook,Nguyễn Văn D,Đầu tư,Đất nền,Nhơn Trạch Đồng Nai,500,1000,Gần KCN,Từ chối,Giá quá cao,Cần tư vấn thêm về pháp lý,2024-01-16 14:00:00,30`
     const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a'); a.href = url; a.download = 'template_tu_van.csv'; a.click()

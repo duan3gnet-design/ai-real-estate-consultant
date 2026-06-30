@@ -2,14 +2,14 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
-from app.database import init_db
+from app.es_client import init_es
 from app.routers import chat, properties, consultations
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("[Main] Initializing database...")
-    init_db()
+    print("[Main] Connecting to Elasticsearch...")
+    init_es()
     print("[Main] Server ready at http://127.0.0.1:8765")
     yield
     print("[Main] Shutting down.")
@@ -17,7 +17,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="AI Real Estate Consultant API",
-    version="3.0.0",
+    version="4.0.0",
     lifespan=lifespan,
 )
 
@@ -36,7 +36,12 @@ app.include_router(consultations.router)
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "3.0.0"}
+    from app.es_client import get_es
+    try:
+        es_health = get_es().cluster.health()
+        return {"status": "ok", "version": "4.0.0", "elasticsearch": es_health["status"]}
+    except Exception as e:
+        return {"status": "error", "version": "4.0.0", "elasticsearch_error": str(e)}
 
 
 if __name__ == "__main__":
